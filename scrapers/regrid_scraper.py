@@ -1,21 +1,26 @@
 """
-Regrid scraper for hctx-developers (v0.2 — patched API syntax).
+Regrid scraper for hctx-developers (v0.3 — respects 4-field API limit).
 
 Pulls vacant/development-stage parcels owned by LLC-type entities in
 Fort Bend and Harris counties using the Regrid Parcel API v2.
 
-v0.2 fixes:
-  - Correct filter syntax: fields[name][op]=value (was: name[op]=value)
-  - Use geoid (FIPS) for county filter — rock-solid, no slug guesswork
+v0.3 fixes:
+  - Regrid v2 allows max 4 fields per query. v0.2 used 5 (geoid, gisacre[gte],
+    gisacre[lte], saledate[gte], owner[ilike]) and was silently rejected.
+  - Now uses 3 fields: geoid[eq], ll_gisacre[between], owner[ilike]
+  - saledate recency is applied CLIENT-SIDE during flattening, as a tag
+    rather than a hard filter — keeps parcels with NULL saledate (which is
+    most of them) instead of dropping them entirely
+  - Adds is_recent_sale flag to CSV output for easy filtering in Excel
+
+v0.2 fixes (kept):
+  - Correct filter syntax: fields[name][op]=value
+  - Use geoid (FIPS) for county filter
   - Fixed response parsing for data.parcels.features and properties.fields
-  - Added a [count] preview before each fetch for cost visibility
+  - count preview before each fetch
 
 Usage:
     REGRID_TOKEN=xxxx python scrapers/regrid_scraper.py
-
-Output:
-    output/regrid_raw_YYYY-MM-DD.json    (full GeoJSON for debugging)
-    output/regrid_leads_YYYY-MM-DD.csv   (flattened lead list)
 """
 
 import os
@@ -38,13 +43,11 @@ if not REGRID_TOKEN:
 API_BASE = "https://app.regrid.com/api/v2/parcels/query"
 
 # Counties — use FIPS geoid (5-digit) for unambiguous filtering.
-# TX = 48; Fort Bend county = 157; Harris = 201
 TARGET_COUNTIES = [
     {"name": "Fort Bend", "geoid": "48157"},
     {"name": "Harris",    "geoid": "48201"},
 ]
 
-# Avatar filters: vacant/transitional land likely being graded for development.
 OWNER_KEYWORDS = [
     "LLC", "DEVELOPMENT", "LAND", "HOLDINGS",
     "PARTNERS", "INVESTMENTS", "PROPERTIES", "GROUP",
@@ -52,13 +55,9 @@ OWNER_KEYWORDS = [
 
 MIN_ACRES = 3.0
 MAX_ACRES = 200.0
-SALE_DATE_LOOKBACK_MONTHS = 24
+SALE_DATE_LOOKBACK_MONTHS = 24   # applied client-side now
 
-# Rate limiting: Regrid allows ~200 req/min. We'll throttle for safety.
 REQUEST_INTERVAL_SEC = 0.6
-
-# Soft cap so a runaway query doesn't burn through your monthly Regrid quota.
-# At 2000 records/month plan, this keeps a single run well under cap.
 MAX_PARCELS_PER_REQUEST_TYPE = 1500
 
 # ---------------------------------------------------------------------------
@@ -71,6 +70,9 @@ logging.basicConfig(
 )
 log = logging.getLogger("regrid_scraper")
 
+# Computed once for client-side saledate tagging
+RECENT_SALE_CUTOFF = datetime.utcnow() - timedelta(days=30 * SALE_DATE_LOOKBACK_MONTHS)
+
 
 # ---------------------------------------------------------------------------
 # API helpers
@@ -80,20 +82,20 @@ def build_base_filters(geoid: str, owner_keyword: str) -> dict:
     """
     Build the fields[...] filter set for v2 /parcels/query.
 
-    All filters AND together. Format is fields[field_name][operator]=value.
+    Max 4 fields per Regrid rules. We use exactly 3:
+      - geoid (county)
+      - ll_gisacre (between min/max — counts as ONE field with two operators)
+      - owner (ilike substring match)
     """
-    cutoff = (datetime.utcnow() - timedelta(days=30 * SALE_DATE_LOOKBACK_MONTHS)).strftime("%Y/%m/%d")
     return {
-        "fields[geoid][eq]":       geoid,
-        "fields[ll_gisacre][gte]": MIN_ACRES,
-        "fields[ll_gisacre][lte]": MAX_ACRES,
-        "fields[saledate][gte]":   cutoff,
-        "fields[owner][ilike]":    owner_keyword,  # case-insensitive substring match
+        "fields[geoid][eq]":           geoid,
+        "fields[ll_gisacre][between]": f"[{MIN_ACRES}, {MAX_ACRES}]",
+        "fields[owner][ilike]":        owner_keyword,
     }
 
 
 def get_count(county: dict, owner_keyword: str) -> int:
-    """Get total parcel count for this filter combo without burning quota."""
+    """Get total parcel count without burning quota (count requests are free)."""
     params = build_base_filters(county["geoid"], owner_keyword)
     params["token"] = REGRID_TOKEN
     params["return_count"] = "true"
@@ -129,7 +131,7 @@ def fetch_parcels_for_owner(county: dict, owner_keyword: str) -> list:
         return []
 
     all_features = []
-    offset_id = 0  # v2 requires offset_id=0 on the initial paged request
+    offset_id = 0
     page = 1
 
     while True:
@@ -215,12 +217,12 @@ LEAD_FIELDS = [
     "site_address", "site_city", "site_zip",
     "mailing_address", "mailing_city", "mailing_state", "mailing_zip",
     "gisacre", "land_use_desc", "saledate", "saleprice",
-    "matched_keyword", "lat", "lon", "regrid_path",
+    "is_recent_sale", "matched_keyword", "lat", "lon", "regrid_path",
 ]
 
 
 def _centroid_from_geometry(geom: dict):
-    """Quick centroid estimate from any GeoJSON geometry. Returns (lat, lon) or ('','')."""
+    """Quick centroid estimate from any GeoJSON geometry."""
     if not geom:
         return "", ""
     coords = geom.get("coordinates")
@@ -229,8 +231,21 @@ def _centroid_from_geometry(geom: dict):
     while isinstance(coords, list) and coords and isinstance(coords[0], list):
         coords = coords[0]
     if isinstance(coords, list) and len(coords) >= 2:
-        return coords[1], coords[0]  # lat, lon
+        return coords[1], coords[0]
     return "", ""
+
+
+def _is_recent_sale(saledate_str: str) -> str:
+    """Return 'Y'/'N'/'' for whether saledate is within our lookback window."""
+    if not saledate_str:
+        return ""
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%m/%d/%Y"):
+        try:
+            d = datetime.strptime(saledate_str, fmt)
+            return "Y" if d >= RECENT_SALE_CUTOFF else "N"
+        except ValueError:
+            continue
+    return ""
 
 
 def flatten_feature(feat: dict) -> dict:
@@ -242,6 +257,8 @@ def flatten_feature(feat: dict) -> dict:
     lon = fields.get("lon", "")
     if not lat or not lon:
         lat, lon = _centroid_from_geometry(feat.get("geometry"))
+
+    saledate = fields.get("saledate", "")
 
     return {
         "ll_uuid":         fields.get("ll_uuid", "") or props.get("ll_uuid", ""),
@@ -257,8 +274,9 @@ def flatten_feature(feat: dict) -> dict:
         "mailing_zip":     fields.get("mail_zip", ""),
         "gisacre":         fields.get("ll_gisacre") or fields.get("gisacre", ""),
         "land_use_desc":   fields.get("lbcs_activity_desc", "") or fields.get("usedesc", ""),
-        "saledate":        fields.get("saledate", ""),
+        "saledate":        saledate,
         "saleprice":       fields.get("saleprice", ""),
+        "is_recent_sale":  _is_recent_sale(saledate),
         "matched_keyword": props.get("_matched_keyword", ""),
         "lat":             lat,
         "lon":             lon,
@@ -290,7 +308,7 @@ def write_outputs(features: list) -> None:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    log.info("hctx-developers Regrid scraper v0.2 starting")
+    log.info("hctx-developers Regrid scraper v0.3 starting")
     features = scrape_all()
     if features:
         write_outputs(features)
