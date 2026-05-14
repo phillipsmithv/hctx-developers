@@ -1,0 +1,49 @@
+name: Daily Developer Lead Scrape
+
+on:
+  schedule:
+    # 7:00 UTC = 2:00 AM Houston (CST) / 1:00 AM (CDT). Same as hctx-intel.
+    - cron: '0 7 * * *'
+  workflow_dispatch:  # allow manual run from the Actions tab
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Run Regrid scraper
+        env:
+          REGRID_TOKEN: ${{ secrets.REGRID_TOKEN }}
+        run: python scrapers/regrid_scraper.py
+
+      - name: Upload CSV artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: regrid-leads-${{ github.run_id }}
+          path: output/*.csv
+          retention-days: 30
+
+      # Phase 2 (not active yet): commit results to a results branch
+      # so the dashboard can read them. Uncomment once you're ready.
+      #
+      # - name: Commit results
+      #   run: |
+      #     git config user.name "github-actions[bot]"
+      #     git config user.email "github-actions[bot]@users.noreply.github.com"
+      #     git checkout -B results
+      #     git add output/
+      #     git commit -m "Daily scrape $(date -u +%Y-%m-%d)" || echo "No changes"
+      #     git push -f origin results
