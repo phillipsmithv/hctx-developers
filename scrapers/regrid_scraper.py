@@ -1,8 +1,14 @@
 """
-Regrid scraper for hctx-developers.
+Regrid scraper for hctx-developers (v0.2 — patched API syntax).
 
 Pulls vacant/development-stage parcels owned by LLC-type entities in
 Fort Bend and Harris counties using the Regrid Parcel API v2.
+
+v0.2 fixes:
+  - Correct filter syntax: fields[name][op]=value (was: name[op]=value)
+  - Use geoid (FIPS) for county filter — rock-solid, no slug guesswork
+  - Fixed response parsing for data.parcels.features and properties.fields
+  - Added a [count] preview before each fetch for cost visibility
 
 Usage:
     REGRID_TOKEN=xxxx python scrapers/regrid_scraper.py
@@ -31,17 +37,14 @@ if not REGRID_TOKEN:
 
 API_BASE = "https://app.regrid.com/api/v2/parcels/query"
 
-# Counties we care about in v1. Regrid uses FIPS county codes; these are TX.
-# Fort Bend = 48157, Harris = 48201
+# Counties — use FIPS geoid (5-digit) for unambiguous filtering.
+# TX = 48; Fort Bend county = 157; Harris = 201
 TARGET_COUNTIES = [
-    {"name": "Fort Bend", "fips": "48157", "path": "/us/tx/fort-bend"},
-    {"name": "Harris",    "fips": "48201", "path": "/us/tx/harris"},
+    {"name": "Fort Bend", "geoid": "48157"},
+    {"name": "Harris",    "geoid": "48201"},
 ]
 
 # Avatar filters: vacant/transitional land likely being graded for development.
-# - Acreage 3-200 (your fill-dirt sweet spot)
-# - Owner name contains LLC-type keyword
-# - Last sale within 24 months (signals active development)
 OWNER_KEYWORDS = [
     "LLC", "DEVELOPMENT", "LAND", "HOLDINGS",
     "PARTNERS", "INVESTMENTS", "PROPERTIES", "GROUP",
@@ -51,8 +54,12 @@ MIN_ACRES = 3.0
 MAX_ACRES = 200.0
 SALE_DATE_LOOKBACK_MONTHS = 24
 
-# Rate limiting: Regrid allows ~200 req/min. We'll throttle to 100/min for safety.
+# Rate limiting: Regrid allows ~200 req/min. We'll throttle for safety.
 REQUEST_INTERVAL_SEC = 0.6
+
+# Soft cap so a runaway query doesn't burn through your monthly Regrid quota.
+# At 2000 records/month plan, this keeps a single run well under cap.
+MAX_PARCELS_PER_REQUEST_TYPE = 1500
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -69,56 +76,85 @@ log = logging.getLogger("regrid_scraper")
 # API helpers
 # ---------------------------------------------------------------------------
 
-def build_query_params(county_path: str, offset_id: int = None) -> dict:
+def build_base_filters(geoid: str, owner_keyword: str) -> dict:
     """
-    Build query params for the Regrid v2 parcels/query endpoint.
+    Build the fields[...] filter set for v2 /parcels/query.
 
-    We filter on:
-      - path (county scope)
-      - gisacre between MIN_ACRES and MAX_ACRES
-      - saledate >= cutoff date
-      - owner contains any of our LLC keywords (OR'd via multiple requests)
-
-    Regrid AND's multiple filter params, so to OR across owner keywords
-    we make one request per keyword and dedupe by ll_uuid downstream.
+    All filters AND together. Format is fields[field_name][operator]=value.
     """
     cutoff = (datetime.utcnow() - timedelta(days=30 * SALE_DATE_LOOKBACK_MONTHS)).strftime("%Y/%m/%d")
-
-    params = {
-        "token": REGRID_TOKEN,
-        "path": county_path,
-        "gisacre[gte]": MIN_ACRES,
-        "gisacre[lte]": MAX_ACRES,
-        "saledate[gte]": cutoff,
-        "limit": 1000,
-        "return_custom": "true",
+    return {
+        "fields[geoid][eq]":       geoid,
+        "fields[ll_gisacre][gte]": MIN_ACRES,
+        "fields[ll_gisacre][lte]": MAX_ACRES,
+        "fields[saledate][gte]":   cutoff,
+        "fields[owner][ilike]":    owner_keyword,  # case-insensitive substring match
     }
-    if offset_id:
-        params["offset_id"] = offset_id
-    return params
+
+
+def get_count(county: dict, owner_keyword: str) -> int:
+    """Get total parcel count for this filter combo without burning quota."""
+    params = build_base_filters(county["geoid"], owner_keyword)
+    params["token"] = REGRID_TOKEN
+    params["return_count"] = "true"
+
+    try:
+        r = requests.get(API_BASE, params=params, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        return data.get("count", 0)
+    except requests.HTTPError as e:
+        log.warning(f"    count request HTTP error: {e}")
+        try:
+            log.warning(f"    response body: {r.text[:300]}")
+        except Exception:
+            pass
+        return 0
+    except Exception as e:
+        log.warning(f"    count request error: {e}")
+        return 0
 
 
 def fetch_parcels_for_owner(county: dict, owner_keyword: str) -> list:
     """Fetch all parcels matching one owner keyword in one county, with pagination."""
+    count = get_count(county, owner_keyword)
+    log.info(f"  [{county['name']}] owner~'{owner_keyword}' count={count}")
+
+    if count == 0:
+        return []
+
+    if count > MAX_PARCELS_PER_REQUEST_TYPE:
+        log.warning(f"    {count} exceeds safety cap {MAX_PARCELS_PER_REQUEST_TYPE}, "
+                    f"skipping this combo. Tighten filters if you want to include it.")
+        return []
+
     all_features = []
-    offset_id = None
+    offset_id = 0  # v2 requires offset_id=0 on the initial paged request
     page = 1
 
     while True:
-        params = build_query_params(county["path"], offset_id)
-        params["owner[ilike]"] = f"%{owner_keyword}%"
+        params = build_base_filters(county["geoid"], owner_keyword)
+        params["token"] = REGRID_TOKEN
+        params["limit"] = 1000
+        params["offset_id"] = offset_id
+        params["return_custom"] = "true"
+        params["return_geometry"] = "true"
 
-        log.info(f"  [{county['name']}] owner~'{owner_keyword}' page {page}")
+        log.info(f"    fetching page {page} (offset_id={offset_id})")
         try:
-            r = requests.get(API_BASE, params=params, timeout=30)
+            r = requests.get(API_BASE, params=params, timeout=60)
             r.raise_for_status()
         except requests.HTTPError as e:
-            log.warning(f"    HTTP error: {e}. Sleeping 5s and continuing.")
-            time.sleep(5)
+            log.warning(f"    HTTP error on page {page}: {e}")
+            try:
+                log.warning(f"    response body: {r.text[:300]}")
+            except Exception:
+                pass
             break
 
         data = r.json()
-        features = data.get("parcels", {}).get("features", []) if isinstance(data.get("parcels"), dict) else data.get("features", [])
+        parcels = data.get("parcels", {})
+        features = parcels.get("features", []) if isinstance(parcels, dict) else []
 
         if not features:
             log.info(f"    no more results")
@@ -127,14 +163,14 @@ def fetch_parcels_for_owner(county: dict, owner_keyword: str) -> list:
         all_features.extend(features)
         log.info(f"    +{len(features)} parcels (running total: {len(all_features)})")
 
-        # Pagination: if we got less than the limit, we're done.
         if len(features) < 1000:
             break
 
-        # Otherwise grab the last parcel's id for next page.
-        last_id = features[-1].get("properties", {}).get("id")
-        if not last_id:
+        last_id = features[-1].get("id")
+        if last_id is None:
+            log.warning(f"    last feature missing 'id', can't paginate further")
             break
+
         offset_id = last_id
         page += 1
         time.sleep(REQUEST_INTERVAL_SEC)
@@ -147,20 +183,22 @@ def fetch_parcels_for_owner(county: dict, owner_keyword: str) -> list:
 # ---------------------------------------------------------------------------
 
 def scrape_all() -> list:
-    """Loop over counties × owner keywords. Dedupe by ll_uuid."""
+    """Loop counties × owner keywords. Dedupe by ll_uuid."""
     seen_uuids = set()
     deduped_features = []
 
     for county in TARGET_COUNTIES:
-        log.info(f"==> County: {county['name']} ({county['path']})")
+        log.info(f"==> County: {county['name']} (geoid={county['geoid']})")
         for kw in OWNER_KEYWORDS:
             features = fetch_parcels_for_owner(county, kw)
             for f in features:
-                uuid = f.get("properties", {}).get("ll_uuid")
+                props = f.get("properties", {})
+                fields = props.get("fields", {})
+                uuid = fields.get("ll_uuid") or props.get("ll_uuid")
                 if uuid and uuid not in seen_uuids:
                     seen_uuids.add(uuid)
-                    f["properties"]["_matched_keyword"] = kw
-                    f["properties"]["_county"] = county["name"]
+                    props["_matched_keyword"] = kw
+                    props["_county"] = county["name"]
                     deduped_features.append(f)
             time.sleep(REQUEST_INTERVAL_SEC)
 
@@ -177,47 +215,54 @@ LEAD_FIELDS = [
     "site_address", "site_city", "site_zip",
     "mailing_address", "mailing_city", "mailing_state", "mailing_zip",
     "gisacre", "land_use_desc", "saledate", "saleprice",
-    "matched_keyword", "lat", "lon",
+    "matched_keyword", "lat", "lon", "regrid_path",
 ]
 
 
-def flatten_feature(feat: dict) -> dict:
-    """Flatten a Regrid GeoJSON Feature into a CSV-friendly row."""
-    p = feat.get("properties", {})
-    fields = p.get("fields", p)  # v2 sometimes nests under 'fields'
+def _centroid_from_geometry(geom: dict):
+    """Quick centroid estimate from any GeoJSON geometry. Returns (lat, lon) or ('','')."""
+    if not geom:
+        return "", ""
+    coords = geom.get("coordinates")
+    if not coords:
+        return "", ""
+    while isinstance(coords, list) and coords and isinstance(coords[0], list):
+        coords = coords[0]
+    if isinstance(coords, list) and len(coords) >= 2:
+        return coords[1], coords[0]  # lat, lon
+    return "", ""
 
-    # Centroid for lat/lon (rough — actual centroid calc would use shapely)
-    geom = feat.get("geometry", {})
-    lat = lon = ""
-    if geom.get("type") == "Point":
-        lon, lat = geom["coordinates"]
-    elif geom.get("coordinates"):
-        # Just grab first coord for now; we'll do proper centroids in enrichment layer
-        coords = geom["coordinates"]
-        while isinstance(coords, list) and coords and isinstance(coords[0], list):
-            coords = coords[0]
-        if len(coords) == 2:
-            lon, lat = coords
+
+def flatten_feature(feat: dict) -> dict:
+    """Flatten a Regrid v2 GeoJSON Feature into a CSV row."""
+    props = feat.get("properties", {})
+    fields = props.get("fields", {})
+
+    lat = fields.get("lat", "")
+    lon = fields.get("lon", "")
+    if not lat or not lon:
+        lat, lon = _centroid_from_geometry(feat.get("geometry"))
 
     return {
-        "ll_uuid":           fields.get("ll_uuid", ""),
-        "county":            p.get("_county", ""),
-        "parcel_id":         fields.get("parcelnumb", ""),
-        "owner_name":        fields.get("owner", ""),
-        "site_address":      fields.get("address", ""),
-        "site_city":         fields.get("scity", "") or fields.get("city", ""),
-        "site_zip":          fields.get("szip", ""),
-        "mailing_address":   fields.get("mailadd", ""),
-        "mailing_city":      fields.get("mail_city", ""),
-        "mailing_state":     fields.get("mail_state2", ""),
-        "mailing_zip":       fields.get("mail_zip", ""),
-        "gisacre":           fields.get("gisacre", ""),
-        "land_use_desc":     fields.get("lbcs_activity_desc", "") or fields.get("usedesc", ""),
-        "saledate":          fields.get("saledate", ""),
-        "saleprice":         fields.get("saleprice", ""),
-        "matched_keyword":   p.get("_matched_keyword", ""),
-        "lat":               lat,
-        "lon":               lon,
+        "ll_uuid":         fields.get("ll_uuid", "") or props.get("ll_uuid", ""),
+        "county":          props.get("_county", ""),
+        "parcel_id":       fields.get("parcelnumb", ""),
+        "owner_name":      fields.get("owner", ""),
+        "site_address":    fields.get("address", ""),
+        "site_city":       fields.get("scity", "") or fields.get("city", ""),
+        "site_zip":        fields.get("szip", ""),
+        "mailing_address": fields.get("mailadd", ""),
+        "mailing_city":    fields.get("mail_city", ""),
+        "mailing_state":   fields.get("mail_state2", ""),
+        "mailing_zip":     fields.get("mail_zip", ""),
+        "gisacre":         fields.get("ll_gisacre") or fields.get("gisacre", ""),
+        "land_use_desc":   fields.get("lbcs_activity_desc", "") or fields.get("usedesc", ""),
+        "saledate":        fields.get("saledate", ""),
+        "saleprice":       fields.get("saleprice", ""),
+        "matched_keyword": props.get("_matched_keyword", ""),
+        "lat":             lat,
+        "lon":             lon,
+        "regrid_path":     fields.get("path", "") or props.get("path", ""),
     }
 
 
@@ -226,13 +271,11 @@ def write_outputs(features: list) -> None:
     out_dir = Path("output")
     out_dir.mkdir(exist_ok=True)
 
-    # Raw GeoJSON for debugging / map rendering later
     raw_path = out_dir / f"regrid_raw_{today}.json"
     with raw_path.open("w") as f:
         json.dump({"type": "FeatureCollection", "features": features}, f, indent=2)
     log.info(f"Wrote {raw_path}")
 
-    # Flat CSV for manual review
     csv_path = out_dir / f"regrid_leads_{today}.csv"
     with csv_path.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=LEAD_FIELDS)
@@ -247,10 +290,10 @@ def write_outputs(features: list) -> None:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    log.info("hctx-developers Regrid scraper v0.1 starting")
+    log.info("hctx-developers Regrid scraper v0.2 starting")
     features = scrape_all()
     if features:
         write_outputs(features)
     else:
-        log.warning("No features returned. Check filters and token.")
+        log.warning("No features returned. Check filters, token, and Regrid quota.")
     log.info("Done.")
